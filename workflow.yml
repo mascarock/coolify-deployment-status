@@ -1,0 +1,100 @@
+name: Deployment Notification Workflow
+
+on:
+  push:
+    branches:
+      - staging
+
+jobs:
+  notify-deployment:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set deployment status to pending
+        run: |
+          curl -X POST \
+          -H "Authorization: token ${{ secrets.GITHUB_PAT }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }} \
+          -d '{"state": "pending", "description": "Deployment initiated", "context": "Deployment"}'
+
+      - name: Capture deployment start time
+        run: |
+          DEPLOY_START_TIME=$(date -u '+%Y-%m-%dT%H:%M:%S')
+          echo "DEPLOY_START_TIME=$DEPLOY_START_TIME" >> $GITHUB_ENV
+
+      - name: Monitor Coolify Deployment Status
+        id: monitor
+        env:
+          COOLIFY_AUTH_TOKEN: ${{ secrets.COOLIFY_AUTH_TOKEN }}
+          COOLIFY_BASE_URL: ${{ secrets.COOLIFY_BASE_URL }}
+          COOLIFY_APP_ID: ${{ secrets.COOLIFY_APP_ID }}
+        run: |
+          deployment_status="in_progress"
+          
+          # Step 1: Wait for any deployments to complete
+          for i in {1..60}; do
+            # Fetch the list of ongoing deployments
+            response=$(curl -s -H "Authorization: Bearer $COOLIFY_AUTH_TOKEN" \
+              "$COOLIFY_BASE_URL/api/v1/deployments?appId=$COOLIFY_APP_ID&limit=1")
+
+            # If response is empty, break the loop
+            if [ "$response" == "[]" ]; then
+              break
+            else
+              sleep 20
+            fi
+          done
+
+          # Step 2: Confirm application status is running:healthy
+          for i in {1..30}; do
+            # Fetch the application status
+            response=$(curl -s -H "Authorization: Bearer $COOLIFY_AUTH_TOKEN" \
+              "$COOLIFY_BASE_URL/api/v1/applications/$COOLIFY_APP_ID")
+
+            # Extract status and updated_at timestamp using jq
+            app_status=$(echo "$response" | jq -r '.status')
+            update_time=$(echo "$response" | jq -r '.updated_at')
+            git_commit_sha=$(echo "$response" | jq -r '.git_commit_sha')
+
+            # Compare timestamps (update_time should be after DEPLOY_START_TIME)
+            if [[ "$update_time" > "$DEPLOY_START_TIME" ]]; then
+              if [[ "$app_status" == "running:healthy" ]]; then
+                deployment_status="success"
+                break
+              elif [[ "$app_status" == "running:unhealthy" || "$app_status" == "error" || "$app_status" == "failed" ]]; then
+                deployment_status="failure"
+                break
+              fi
+            fi
+            sleep 20
+          done
+
+          # Exit gracefully if still in progress after retries
+          if [ "$deployment_status" == "in_progress" ]; then
+            deployment_status="failure"
+          fi
+
+          # Set an output for the deployment status
+          echo "deployment_status=$deployment_status" >> $GITHUB_ENV
+
+      - name: Update deployment status to success
+        if: env.deployment_status == 'success'
+        run: |
+          curl -X POST \
+          -H "Authorization: token ${{ secrets.GITHUB_PAT }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }} \
+          -d '{"state": "success", "description": "Deployment completed successfully", "context": "Deployment"}'
+
+      - name: Update deployment status to failure
+        if: env.deployment_status == 'failure'
+        run: |
+          curl -X POST \
+          -H "Authorization: token ${{ secrets.GITHUB_PAT }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }} \
+          -d '{"state": "failure", "description": "Deployment failed", "context": "Deployment"}'
